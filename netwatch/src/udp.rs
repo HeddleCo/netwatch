@@ -13,9 +13,9 @@ use atomic_waker::AtomicWaker;
 use noq_udp::Transmit;
 use tokio::{
     io::Interest,
-    time::{Interval, MissedTickBehavior},
+    time::{Instant, Interval, MissedTickBehavior},
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::IpFamily;
 
@@ -31,10 +31,23 @@ pub struct UdpSocket {
     recv_retry: Mutex<Option<Interval>>,
     /// Wakes a sender to retry a rebind that failed.
     send_retry: Mutex<Option<Interval>>,
+    /// The rebind failure in progress, shared by both directions.
+    rebind_failure: Mutex<Option<RebindFailure>>,
+}
+
+/// A run of failed rebinds, from the first failure until a bind succeeds.
+#[derive(Debug)]
+struct RebindFailure {
+    started: Instant,
+    /// Warnings logged so far; the next one is due `REBIND_WARN_EVERY` later.
+    warnings: u32,
 }
 
 /// How often a socket whose rebind failed tries again.
 const REBIND_RETRY: Duration = Duration::from_millis(10);
+
+/// How often a rebind that keeps failing is reported again.
+const REBIND_WARN_EVERY: Duration = Duration::from_secs(30);
 
 /// UDP socket read/write buffer size (7MB). The value of 7MB is chosen as it
 /// is the max supported by a default configuration of macOS. Some platforms will silently clamp the value.
@@ -107,6 +120,7 @@ impl UdpSocket {
 
             drop(guard);
         }
+        self.rebind_recovered();
 
         // wakeup
         self.wake_all();
@@ -124,6 +138,7 @@ impl UdpSocket {
             is_broken: AtomicBool::new(false),
             recv_retry: Mutex::new(None),
             send_retry: Mutex::new(None),
+            rebind_failure: Mutex::new(None),
         })
     }
 
@@ -318,6 +333,7 @@ impl UdpSocket {
         self.is_broken
             .store(false, std::sync::atomic::Ordering::Release);
         drop(guard);
+        self.rebind_recovered();
         self.wake_all();
         Ok(())
     }
@@ -338,11 +354,11 @@ impl UdpSocket {
                 retry.lock().unwrap_or_else(|e| e.into_inner()).take();
                 return Poll::Ready(());
             };
+            self.rebind_failed(&err);
             // A rebind completed by the other direction wakes this one too.
             waker.register(cx.waker());
             let mut retry = retry.lock().unwrap_or_else(|e| e.into_inner());
             let timer = retry.get_or_insert_with(|| {
-                warn!("rebind failed, retrying: {err}");
                 let mut timer = tokio::time::interval(REBIND_RETRY);
                 timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 timer
@@ -350,6 +366,47 @@ impl UdpSocket {
             if timer.poll_tick(cx).is_pending() {
                 return Poll::Pending;
             }
+        }
+    }
+
+    /// Reports a failed rebind: once when the failures start, then every
+    /// [`REBIND_WARN_EVERY`] while they go on, since the socket is deaf until
+    /// a bind succeeds.
+    fn rebind_failed(&self, err: &io::Error) {
+        let now = Instant::now();
+        let mut failure = self
+            .rebind_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match failure.as_mut() {
+            None => {
+                warn!("rebind failed, retrying: {err}");
+                *failure = Some(RebindFailure {
+                    started: now,
+                    warnings: 1,
+                });
+            }
+            Some(failure) if now - failure.started >= REBIND_WARN_EVERY * failure.warnings => {
+                let secs = (now - failure.started).as_secs();
+                warn!("rebind still failing after {secs}s: {err}");
+                failure.warnings += 1;
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Reports the end of a run of failed rebinds, if there was one.
+    fn rebind_recovered(&self) {
+        let failure = self
+            .rebind_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(failure) = failure {
+            info!(
+                "rebind succeeded after failing for {:?}",
+                failure.started.elapsed()
+            );
         }
     }
 
@@ -1249,6 +1306,60 @@ mod tests {
         assert_eq!(&buffer[..count], b"ping");
         assert_eq!(from, peer.local_addr()?);
         assert!(!socket.is_broken());
+        Ok(())
+    }
+
+    /// A rebind that keeps failing must keep saying so: the socket cannot
+    /// receive until a bind succeeds, so one warning at the start is not enough.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_rebind_warns_again_while_it_keeps_failing() -> TestResult {
+        use std::{os::fd::AsFd, sync::Arc};
+
+        let socket = Arc::new(UdpSocket::bind_local(IpFamily::V4, 0)?);
+        let addr = socket.local_addr()?;
+        let held = {
+            let guard = socket.socket.read().unwrap();
+            let (inner, _state) = guard.try_get_connected()?;
+            inner.as_fd().try_clone_to_owned()?
+        };
+        assert!(socket.rebind().is_err(), "the held copy keeps the port");
+
+        let warnings = || {
+            let failure = socket.rebind_failure.lock().unwrap();
+            failure.as_ref().map(|failure| failure.warnings)
+        };
+        let recv = tokio::spawn({
+            let socket = socket.clone();
+            async move {
+                let mut buffer = [0u8; 16];
+                let (count, from) = socket.recv_from(&mut buffer).await?;
+                Ok::<_, io::Error>((buffer[..count].to_vec(), from))
+            }
+        });
+
+        tokio::time::sleep(REBIND_WARN_EVERY - Duration::from_secs(1)).await;
+        assert_eq!(warnings(), Some(1), "warned once at the start");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            warnings(),
+            Some(2),
+            "warned again while the port stays held"
+        );
+
+        drop(held);
+        n0_future::future::poll_fn(|cx| socket.poll_writable(cx)).await?;
+        assert_eq!(socket.local_addr()?, addr);
+        assert_eq!(
+            warnings(),
+            None,
+            "the failure run ends when a bind succeeds"
+        );
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        peer.send_to(b"ping", addr)?;
+        let (data, from) = recv.await??;
+        assert_eq!(data, b"ping");
+        assert_eq!(from, peer.local_addr()?);
         Ok(())
     }
 
